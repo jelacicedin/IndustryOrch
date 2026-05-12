@@ -83,9 +83,7 @@ services:
       context: ./backend
       network: host
       dockerfile: Dockerfile
-      args:
-        GLINER_MODEL: ${GLINER_MODEL:-urchade/gliner_medium-v2.1}
-        HF_TOKEN: ${HF_TOKEN:-}
+      args: {}
     container_name: industryorch-app
     network_mode: host
     restart: unless-stopped
@@ -103,11 +101,6 @@ services:
       NEO4J_USER: ${NEO4J_USER:-neo4j}
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:-industryorch2026}
       GRAPH_EXTRACTION_MODEL: ${GRAPH_EXTRACTION_MODEL:-qwen2.5:1.5b}
-      GRAPH_USE_LLM: ${GRAPH_USE_LLM:-false}
-      GLINER_MODEL: ${GLINER_MODEL:-urchade/gliner_medium-v2.1}
-      GRAPH_NLP_MODEL: ${GRAPH_NLP_MODEL:-en_core_web_sm}
-      GLINER_THRESHOLD: ${GLINER_THRESHOLD:-0.4}
-      HF_TOKEN: ${HF_TOKEN:-}
     depends_on:
       postgres:
         condition: service_healthy

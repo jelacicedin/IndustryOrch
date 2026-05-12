@@ -280,14 +280,6 @@ async def _verify_startup() -> None:
                 "llama.cpp server not reachable at %s — %s", llama_server_url, exc
             )
 
-    # --- GLiNER warmup (used for both query-time NER and NLP-path ingest) ---
-    try:
-        from graph_extractor import _get_gliner, GLINER_MODEL as _gliner_model
-        await asyncio.get_running_loop().run_in_executor(None, _get_gliner)
-        logger.info("GLiNER model ready: %s", _gliner_model)
-    except Exception as exc:
-        logger.warning("GLiNER warmup failed — graph search will load on first use: %s", exc)
-
 
 # ---------------------------------------------------------------------------
 # FastAPI app
@@ -377,35 +369,67 @@ async def _hybrid_search(
 # Graph-enhanced retrieval
 # ---------------------------------------------------------------------------
 
+_GRAPH_STOPWORDS = frozenset({
+    "what", "which", "where", "when", "how", "who", "is", "are", "was", "were",
+    "the", "a", "an", "in", "on", "at", "to", "for", "of", "and", "or", "but",
+    "with", "from", "by", "about", "that", "this", "it", "its", "be", "been",
+    "have", "has", "do", "does", "did", "can", "could", "would", "should", "will",
+    "all", "any", "some", "no", "not", "more", "most", "many", "much", "tell",
+    "me", "my", "give", "show", "list", "find", "get", "please",
+})
+
+
+def _extract_query_entities(question: str) -> list[str]:
+    """Extract candidate entity names from a question without an NLP model.
+
+    Prioritises equipment/part identifiers (CP-101, HX-02) and capitalised
+    proper-noun phrases. Falls back to content words ≥ 5 chars if nothing else
+    is found.
+    """
+    terms: list[str] = []
+    seen: set[str] = set()
+
+    # Equipment / part identifiers: CP-101, HX-02, P/N-1234, V-6A
+    for m in re.finditer(r'\b[A-Z]{1,5}[-/]\d+\w*\b', question):
+        t = m.group()
+        if t not in seen:
+            terms.append(t)
+            seen.add(t)
+
+    # Capitalised proper-noun phrases (2+ words)
+    for m in re.finditer(r'\b([A-Z][a-z]{1,}(?:\s+[A-Z][a-z]{1,})+)\b', question):
+        t = m.group()
+        if t not in seen:
+            terms.append(t)
+            seen.add(t)
+
+    # Single capitalised words (mid-sentence only — skip sentence-start word)
+    words = question.split()
+    for w in words[1:]:
+        clean = re.sub(r'\W', '', w)
+        if clean and clean[0].isupper() and clean.lower() not in _GRAPH_STOPWORDS and clean not in seen:
+            terms.append(clean)
+            seen.add(clean)
+
+    # Fallback: content words ≥ 5 chars
+    if not terms:
+        for w in re.findall(r'\b[a-zA-Z]{5,}\b', question):
+            if w.lower() not in _GRAPH_STOPWORDS and w not in seen:
+                terms.append(w)
+                seen.add(w)
+
+    return terms[:5]
+
 
 async def _graph_search(question: str, depth: int = 2) -> dict | None:
-    """Extract entities from the question and traverse the knowledge graph.
-
-    Uses GLiNER for zero-shot NER on the question — no gen-model round-trip,
-    no extra VRAM pressure. Returns center + neighbors + edges for prompt injection.
-    """
+    """Extract entities from the question and traverse the knowledge graph."""
     try:
         client = get_graph_db()
     except RuntimeError:
         logger.debug("Neo4j not available — skipping graph search")
         return None
 
-    # Extract entity names from the question using GLiNER (fast, CPU, in-process)
-    entities: list[str] = []
-    try:
-        from graph_extractor import _get_gliner, ENTITY_TYPES, GLINER_THRESHOLD
-        gliner = _get_gliner()
-        spans = gliner.predict_entities(
-            question, ENTITY_TYPES, threshold=GLINER_THRESHOLD
-        )
-        seen: set[str] = set()
-        for span in spans:
-            name = span["text"].strip()
-            if name and name not in seen:
-                entities.append(name)
-                seen.add(name)
-    except Exception as exc:
-        logger.warning("GLiNER entity extraction from question failed: %s", exc)
+    entities = _extract_query_entities(question)
 
     if not entities:
         logger.debug("No entities found in question — skipping graph search")

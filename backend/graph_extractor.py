@@ -1,19 +1,10 @@
 # Copyright (C) 2026  Edin Jelacic — AGPL-3.0-or-later
 """Entity and relationship extraction from industrial document markdown.
 
-Two extraction paths are available, selected by the GRAPH_USE_LLM env var:
-
-* LLM path (GRAPH_USE_LLM=true, default): batches chunks and sends them to a
-  local Ollama model with JSON grammar constraints. Slower but produces richer
-  attributes and handles domain-specific jargon well.
-
-* NLP path (GRAPH_USE_LLM=false): GLiNER zero-shot NER for entities + spaCy
-  dependency parsing for relationships. No Ollama required; runs entirely
-  in-process on CPU. Typically 10-50x faster than the LLM path.
-
-Setting GRAPH_BATCH_SIZE controls how many chunks are packed into a single LLM
-call (default 3). Larger values reduce round-trips at the cost of longer
-individual generations.
+Batches chunks and sends them to a local Ollama model with JSON grammar
+constraints. Setting GRAPH_BATCH_SIZE controls how many chunks are packed into
+a single LLM call (default 3). Larger values reduce round-trips at the cost of
+longer individual generations.
 """
 
 from __future__ import annotations
@@ -24,7 +15,7 @@ import os
 import re
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Callable
 
 import ollama
 
@@ -44,16 +35,6 @@ MAX_CHUNK_CHARS = 4000
 
 # Chunks packed into a single LLM call — reduces round-trips significantly
 EXTRACTION_BATCH_SIZE = int(os.environ.get("GRAPH_BATCH_SIZE", "3"))
-
-# Toggle extraction backend: true = Ollama LLM, false = GLiNER + spaCy
-GRAPH_USE_LLM = os.environ.get("GRAPH_USE_LLM", "true").lower() in (
-    "true", "1", "yes"
-)
-
-# NLP path settings (only used when GRAPH_USE_LLM=false)
-GLINER_MODEL = os.environ.get("GLINER_MODEL", "urchade/gliner_medium-v2.1")
-NLP_MODEL = os.environ.get("GRAPH_NLP_MODEL", "en_core_web_sm")
-GLINER_THRESHOLD = float(os.environ.get("GLINER_THRESHOLD", "0.4"))
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -115,54 +96,6 @@ RELATIONSHIP_TYPES = [
     "maintained_by",
     "replaces",
 ]
-
-# Verb lemma → relationship type (NLP path only).
-# Covers the most common industrial document verbs.
-VERB_REL_MAP: dict[str, str] = {
-    "feed": "feeds",
-    "supply": "feeds",
-    "pump": "feeds",
-    "deliver": "feeds",
-    "control": "controls",
-    "regulate": "controls",
-    "govern": "controls",
-    "manage": "controls",
-    "require": "requires",
-    "need": "requires",
-    "depend": "requires",
-    "locate": "located_at",
-    "mount": "located_at",
-    "install": "located_at",
-    "position": "located_at",
-    "situate": "located_at",
-    "connect": "connected_to",
-    "attach": "connected_to",
-    "link": "connected_to",
-    "couple": "connected_to",
-    "join": "connected_to",
-    "use": "uses",
-    "utilize": "uses",
-    "employ": "uses",
-    "apply": "uses",
-    "specify": "specifies",
-    "define": "specifies",
-    "describe": "specifies",
-    "indicate": "specifies",
-    "state": "specifies",
-    "warn": "warns_about",
-    "caution": "warns_about",
-    "alert": "warns_about",
-    "maintain": "maintained_by",
-    "service": "maintained_by",
-    "replace": "replaces",
-    "substitute": "replaces",
-    "supersede": "replaces",
-    "contain": "part_of",
-    "include": "part_of",
-    "comprise": "part_of",
-    "consist": "part_of",
-    "incorporate": "part_of",
-}
 
 # ---------------------------------------------------------------------------
 # Chunking for extraction (separate from embedding chunking)
@@ -347,191 +280,6 @@ def _extract_from_batch(
     return result
 
 
-# ---------------------------------------------------------------------------
-# NLP extraction — GLiNER (NER) + spaCy (dependency parsing)
-# ---------------------------------------------------------------------------
-
-_nlp_instance: Any = None
-_gliner_instance: Any = None
-
-
-def _get_nlp() -> Any:
-    global _nlp_instance
-    if _nlp_instance is None:
-        import spacy  # type: ignore[import]
-        _nlp_instance = spacy.load(NLP_MODEL, exclude=["ner"])
-        logger.info("Loaded spaCy model: %s", NLP_MODEL)
-    return _nlp_instance
-
-
-def _get_gliner() -> Any:
-    global _gliner_instance
-    if _gliner_instance is None:
-        from gliner import GLiNER  # type: ignore[import]
-        _gliner_instance = GLiNER.from_pretrained(GLINER_MODEL)
-        logger.info("Loaded GLiNER model: %s", GLINER_MODEL)
-    return _gliner_instance
-
-
-def _gliner_token_len(gliner: Any, text: str) -> int:
-    """Return the number of tokens GLiNER's own tokenizer produces for text."""
-    try:
-        tok = gliner.data_processor.transformer_tokenizer
-        return len(tok.encode(text, add_special_tokens=True))
-    except Exception:
-        return len(text) // 2  # conservative fallback: assume 2 chars/token
-
-
-def _split_for_gliner(
-    gliner: Any, text: str, max_tokens: int = 350
-) -> list[tuple[int, str]]:
-    """Split text into pieces that each fit within max_tokens.
-
-    Splits at word boundaries first, then falls back to hard split.
-    Returns list of (char_offset_in_text, piece_text).
-    """
-    if _gliner_token_len(gliner, text) <= max_tokens:
-        return [(0, text)]
-
-    pieces: list[tuple[int, str]] = []
-    pos = 0
-    while pos < len(text):
-        # Binary-search for the largest prefix that fits
-        lo, hi = pos + 1, len(text)
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            if _gliner_token_len(gliner, text[pos:mid]) <= max_tokens:
-                lo = mid
-            else:
-                hi = mid - 1
-        end = lo
-        # Try to snap back to a word boundary
-        if end < len(text):
-            boundary = text.rfind(" ", pos, end)
-            if boundary > pos:
-                end = boundary
-        pieces.append((pos, text[pos:end]))
-        pos = end
-    return pieces
-
-
-def _extract_with_nlp(
-    chunks: list[str],
-    progress_callback: Callable[[str], None] | None = None,
-) -> ExtractionResult:
-    """Extract entities and relationships without an LLM.
-
-    Uses GLiNER for zero-shot NER (entity recognition) and spaCy dependency
-    parsing for subject-verb-object relationship extraction. No Ollama needed;
-    models run in-process on CPU. Typically 10-50x faster than the LLM path.
-    """
-    gliner = _get_gliner()
-    nlp = _get_nlp()
-
-    seen_entities: dict[str, ExtractedEntity] = {}
-    all_rels: list[ExtractedRelationship] = []
-
-    for i, chunk in enumerate(chunks):
-        if progress_callback and len(chunks) > 1:
-            progress_callback(
-                f"Extracting (NLP) chunk {i + 1}/{len(chunks)} …"
-            )
-
-        # Run spaCy once — used for both sentence splitting and dep-parsing
-        try:
-            doc = nlp(chunk[:10_000])
-        except Exception as exc:
-            logger.warning("spaCy failed on chunk %d: %s", i, exc)
-            continue
-
-        # GLiNER per-sentence, sub-split using the actual tokenizer so we
-        # never guess wrong on dense technical text (part numbers, codes, etc.)
-        char_to_ent: list[tuple[int, int, str]] = []
-
-        for sent in doc.sents:
-            sent_offset = sent.start_char
-            pieces = _split_for_gliner(gliner, sent.text)
-
-            for piece_off, piece_text in pieces:
-                if not piece_text.strip():
-                    continue
-                try:
-                    spans = gliner.predict_entities(
-                        piece_text, ENTITY_TYPES, threshold=GLINER_THRESHOLD
-                    )
-                except Exception as exc:
-                    logger.warning("GLiNER failed on piece: %s", exc)
-                    continue
-
-                abs_off = sent_offset + piece_off
-                for span in spans:
-                    name = span["text"].strip()
-                    etype = span["label"]
-                    if not name or etype not in ENTITY_TYPES:
-                        continue
-                    char_to_ent.append((
-                        abs_off + span["start"],
-                        abs_off + span["end"],
-                        name,
-                    ))
-                    if name not in seen_entities:
-                        seen_entities[name] = ExtractedEntity(
-                            name=name, type=etype
-                        )
-
-        if not char_to_ent:
-            continue
-
-        # spaCy dependency parsing — doc is already parsed, reuse it
-        def _tok_ent(tok) -> str | None:
-            """Return the GLiNER entity name whose span contains this token."""
-            for start, end, name in char_to_ent:
-                if start <= tok.idx < end:
-                    return name
-            return None
-
-        for sent in doc.sents:
-            for tok in sent:
-                if tok.dep_ not in ("nsubj", "nsubjpass"):
-                    continue
-                subj_name = _tok_ent(tok)
-                if not subj_name:
-                    continue
-                verb = tok.head
-                rel_type = VERB_REL_MAP.get(verb.lemma_.lower())
-                if not rel_type:
-                    continue
-                for child in verb.children:
-                    if child.dep_ not in ("dobj", "attr", "pobj", "oprd"):
-                        continue
-                    obj_name = _tok_ent(child)
-                    if not obj_name:
-                        for gc in child.children:
-                            obj_name = _tok_ent(gc)
-                            if obj_name:
-                                break
-                    if obj_name and obj_name != subj_name:
-                        all_rels.append(ExtractedRelationship(
-                            source=subj_name,
-                            target=obj_name,
-                            type=rel_type,
-                        ))
-
-    etype_counts = Counter(e.type for e in seen_entities.values())
-    rtype_counts = Counter(r.type for r in all_rels)
-    logger.info(
-        "NLP extraction complete: %d entities %s | %d rels %s",
-        len(seen_entities),
-        dict(etype_counts),
-        len(all_rels),
-        dict(rtype_counts),
-    )
-
-    return ExtractionResult(
-        entities=list(seen_entities.values()),
-        relationships=all_rels,
-    )
-
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -544,29 +292,15 @@ def extract_graph_from_markdown(
 ) -> ExtractionResult:
     """Extract entities and relationships from document markdown.
 
-    Dispatches to the NLP path (GLiNER + spaCy) when GRAPH_USE_LLM=false,
-    or to the LLM path (Ollama batched calls) when GRAPH_USE_LLM=true (default).
-
-    The NLP path batches chunks into EXTRACTION_BATCH_SIZE groups and sends each
-    batch as a single LLM call. This reduces the number of round-trips from N
-    (one per chunk) to ceil(N / batch_size).
-
-    The extraction model is kept warm (keep_alive="5m") between batches.
-    After the final batch keep_alive=0 evicts it so generation VRAM is free.
+    Batches chunks into EXTRACTION_BATCH_SIZE groups and sends each batch as a
+    single Ollama LLM call, reducing round-trips from N to ceil(N / batch_size).
+    The extraction model is kept warm between batches; keep_alive=0 on the last
+    batch evicts it so generation VRAM is free.
     """
     chunks = _split_markdown_chunks(markdown)
     if not chunks:
         return ExtractionResult()
 
-    if not GRAPH_USE_LLM:
-        if progress_callback:
-            progress_callback(
-                f"Extracting entities from **{len(chunks)}** section(s) "
-                "using GLiNER + spaCy …"
-            )
-        return _extract_with_nlp(chunks, progress_callback=progress_callback)
-
-    # --- LLM path ---
     batches = [
         chunks[i:i + EXTRACTION_BATCH_SIZE]
         for i in range(0, len(chunks), EXTRACTION_BATCH_SIZE)
