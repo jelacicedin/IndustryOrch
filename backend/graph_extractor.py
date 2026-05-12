@@ -373,6 +373,48 @@ def _get_gliner() -> Any:
     return _gliner_instance
 
 
+def _gliner_token_len(gliner: Any, text: str) -> int:
+    """Return the number of tokens GLiNER's own tokenizer produces for text."""
+    try:
+        tok = gliner.data_processor.transformer_tokenizer
+        return len(tok.encode(text, add_special_tokens=True))
+    except Exception:
+        return len(text) // 2  # conservative fallback: assume 2 chars/token
+
+
+def _split_for_gliner(
+    gliner: Any, text: str, max_tokens: int = 350
+) -> list[tuple[int, str]]:
+    """Split text into pieces that each fit within max_tokens.
+
+    Splits at word boundaries first, then falls back to hard split.
+    Returns list of (char_offset_in_text, piece_text).
+    """
+    if _gliner_token_len(gliner, text) <= max_tokens:
+        return [(0, text)]
+
+    pieces: list[tuple[int, str]] = []
+    pos = 0
+    while pos < len(text):
+        # Binary-search for the largest prefix that fits
+        lo, hi = pos + 1, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if _gliner_token_len(gliner, text[pos:mid]) <= max_tokens:
+                lo = mid
+            else:
+                hi = mid - 1
+        end = lo
+        # Try to snap back to a word boundary
+        if end < len(text):
+            boundary = text.rfind(" ", pos, end)
+            if boundary > pos:
+                end = boundary
+        pieces.append((pos, text[pos:end]))
+        pos = end
+    return pieces
+
+
 def _extract_with_nlp(
     chunks: list[str],
     progress_callback: Callable[[str], None] | None = None,
@@ -395,36 +437,52 @@ def _extract_with_nlp(
                 f"Extracting (NLP) chunk {i + 1}/{len(chunks)} …"
             )
 
-        # --- GLiNER zero-shot NER ---
-        try:
-            spans = gliner.predict_entities(
-                chunk, ENTITY_TYPES, threshold=GLINER_THRESHOLD
-            )
-        except Exception as exc:
-            logger.warning("GLiNER failed on chunk %d: %s", i, exc)
-            spans = []
-
-        # char-range → entity name for matching against spaCy tokens
-        char_to_ent: list[tuple[int, int, str]] = []
-        for span in spans:
-            name = span["text"].strip()
-            etype = span["label"]
-            if not name or etype not in ENTITY_TYPES:
-                continue
-            char_to_ent.append((span["start"], span["end"], name))
-            if name not in seen_entities:
-                seen_entities[name] = ExtractedEntity(name=name, type=etype)
-
-        if not char_to_ent:
-            continue
-
-        # --- spaCy dependency parsing for relationships ---
+        # Run spaCy once — used for both sentence splitting and dep-parsing
         try:
             doc = nlp(chunk[:10_000])
         except Exception as exc:
             logger.warning("spaCy failed on chunk %d: %s", i, exc)
             continue
 
+        # GLiNER per-sentence, sub-split using the actual tokenizer so we
+        # never guess wrong on dense technical text (part numbers, codes, etc.)
+        char_to_ent: list[tuple[int, int, str]] = []
+
+        for sent in doc.sents:
+            sent_offset = sent.start_char
+            pieces = _split_for_gliner(gliner, sent.text)
+
+            for piece_off, piece_text in pieces:
+                if not piece_text.strip():
+                    continue
+                try:
+                    spans = gliner.predict_entities(
+                        piece_text, ENTITY_TYPES, threshold=GLINER_THRESHOLD
+                    )
+                except Exception as exc:
+                    logger.warning("GLiNER failed on piece: %s", exc)
+                    continue
+
+                abs_off = sent_offset + piece_off
+                for span in spans:
+                    name = span["text"].strip()
+                    etype = span["label"]
+                    if not name or etype not in ENTITY_TYPES:
+                        continue
+                    char_to_ent.append((
+                        abs_off + span["start"],
+                        abs_off + span["end"],
+                        name,
+                    ))
+                    if name not in seen_entities:
+                        seen_entities[name] = ExtractedEntity(
+                            name=name, type=etype
+                        )
+
+        if not char_to_ent:
+            continue
+
+        # spaCy dependency parsing — doc is already parsed, reuse it
         def _tok_ent(tok) -> str | None:
             """Return the GLiNER entity name whose span contains this token."""
             for start, end, name in char_to_ent:
@@ -448,7 +506,6 @@ def _extract_with_nlp(
                         continue
                     obj_name = _tok_ent(child)
                     if not obj_name:
-                        # One level deeper (e.g. "feeds into [the pump]")
                         for gc in child.children:
                             obj_name = _tok_ent(gc)
                             if obj_name:
