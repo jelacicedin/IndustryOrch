@@ -1,0 +1,95 @@
+services:
+  # -----------------------------------------------------------------------
+  # PostgreSQL + pgvector
+  # -----------------------------------------------------------------------
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: edintech-postgres
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-edintech}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_DB:   ${POSTGRES_DB:-edintechrag}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./supabase/20260505_init.sql:/docker-entrypoint-initdb.d/001_init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-edintech} -d ${POSTGRES_DB:-edintechrag}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # -----------------------------------------------------------------------
+  # llama.cpp server — alternative generation backend
+  # Uncomment below and set GEN_BACKEND=llama_cpp in .env to use it.
+  # Requires MODEL_PATH and MODEL_FILE env vars pointing to a GGUF model.
+  # -----------------------------------------------------------------------
+  # llama-server:
+  #   container_name: edintech-llama
+  #   restart: unless-stopped
+  #   ports:
+  #     - "${LLAMA_PORT:-8080}:8080"
+  #   volumes:
+  #     - ${MODEL_PATH:-/data/models}:/models:ro
+  #   command: >
+  #     /bin/bash -c "
+  #       apt-get update && apt-get install -y wget ca-certificates &&
+  #       wget -q https://github.com/ggerganov/llama.cpp/releases/download/b3845/llama-server-linux-x64.tar.gz &&
+  #       tar xzf llama-server-linux-x64.tar.gz &&
+  #       ./llama-server --model /models/${MODEL_FILE} --port 8080 --host 0.0.0.0
+  #         --n-gpu-layers 999 -c 32768 --temp 0.6 --top-k 20 --top-p 0.95
+  #         --presence-penalty 1.5
+  #     "
+  #   depends_on:
+  #     - ollama
+
+  # -----------------------------------------------------------------------
+  # EdinTech-RAG API server
+  # Generation backend controlled by GEN_BACKEND env var:
+  #   - "ollama"      (default, uses Ollama chat endpoint)
+  #   - "llama_cpp"   (uses llama.cpp /v1/chat/completions)
+  # -----------------------------------------------------------------------
+  app:
+    build:
+      context: ./backend
+      network: host
+      dockerfile: Dockerfile
+    container_name: edintech-app
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-edintech}:${POSTGRES_PASSWORD:-password}@localhost:5432/${POSTGRES_DB:-edintechrag}
+      OLLAMA_URL:  http://localhost:11434
+      EMBED_MODEL: ${EMBED_MODEL:-qwen3-embedding:0.6b}
+      GEN_BACKEND: ${GEN_BACKEND:-ollama}
+      GENERATION_MODEL: ${GENERATION_MODEL:-qwen3.6:27b}
+      OLLAMA_THINK: ${OLLAMA_THINK:-true}
+      LLAMA_SERVER_URL: ${LLAMA_SERVER_URL:-http://localhost:8080}
+      VISION_MODEL: ${VISION_MODEL:-}
+      APP_PORT: ${APP_PORT:-8001}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # -----------------------------------------------------------------------
+  # Streamlit frontend — web UI for document Q&A
+  # -----------------------------------------------------------------------
+  streamlit:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    container_name: edintech-streamlit
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      BACKEND_URL: http://localhost:${APP_PORT:-8000}
+    depends_on:
+      - app
+
+  # -----------------------------------------------------------------------
+  # Ingestion worker — pulls files from /ingest and processes them
+  # -----------------------------------------------------------------------
+
+volumes:
+  pgdata:
