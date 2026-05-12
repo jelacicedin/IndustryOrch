@@ -28,7 +28,7 @@ from typing import Any, Callable
 
 import ollama
 
-logger = logging.getLogger("edintech-graph")
+logger = logging.getLogger("industryorch-graph")
 
 # ---------------------------------------------------------------------------
 # Configuration

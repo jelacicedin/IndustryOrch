@@ -1,4 +1,4 @@
-# EdinTech-RAG — Python dependencies
+# IndustryOrch — Python dependencies
 # ====================================
 
 # Web framework

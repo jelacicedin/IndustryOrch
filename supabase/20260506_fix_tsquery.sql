@@ -1,7 +1,7 @@
 -- ============================================================
 -- Migration: fix hybrid_search to use plainto_tsquery throughout
 -- Apply to a running database:
---   docker exec -i edintech-postgres psql -U edintech edintechrag \
+--   docker exec -i industryorch-postgres psql -U industryorch industryorch \
 --     < supabase/20260506_fix_tsquery.sql
 -- ============================================================
 

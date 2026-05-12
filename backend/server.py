@@ -1,5 +1,5 @@
 # Copyright (C) 2026  Edin Jelacic — AGPL-3.0-or-later
-"""EdinTech-RAG — FastAPI server for industrial document Q&A.
+"""IndustryOrch — FastAPI server for industrial document Q&A.
 
 Provides a REST API that embeds user questions, performs hybrid search
 (semantic + keyword via RRF) against the ingested document database, and
@@ -48,7 +48,7 @@ from neo4j_client import (
 
 env_db_url = os.environ.get(
     "DATABASE_URL",
-    "postgresql://edintech:password@localhost:5432/edintechrag",
+    "postgresql://edintech:password@localhost:5432/industryorch",
 )
 ollama_url = os.environ.get("OLLAMA_URL", "http://host.docker.internal:11434")
 embed_model = os.environ.get("EMBED_MODEL", "qwen3-embedding:0.6b")
@@ -72,7 +72,7 @@ llama_server_url = os.environ.get(
 # The Python 'ollama' library reads OLLAMA_HOST (not OLLAMA_BASE_URL)
 os.environ["OLLAMA_HOST"] = ollama_url.rstrip("/")
 
-logger = logging.getLogger("edintech-rag")
+logger = logging.getLogger("industryorch")
 
 # In-memory progress store for ingest polling
 _ingest_progress: dict[str, dict] = {}
@@ -219,11 +219,11 @@ class HealthStatus(BaseModel):
 async def lifespan(app: FastAPI):
     """Validate all external dependencies on startup."""
     await _verify_startup()
-    logger.info("EdinTech-RAG server started successfully (backend=%s).", gen_backend)
+    logger.info("IndustryOrch server started successfully (backend=%s).", gen_backend)
     yield
     close_graph_db()
     await _close_pool()
-    logger.info("EdinTech-RAG server shutting down.")
+    logger.info("IndustryOrch server shutting down.")
 
 
 async def _verify_startup() -> None:
@@ -294,7 +294,7 @@ async def _verify_startup() -> None:
 # ---------------------------------------------------------------------------
 
 app = FastAPI(
-    title="EdinTech-RAG",
+    title="IndustryOrch",
     description="Industrial document Q&A via local RAG with hybrid search.",
     version="0.1.0",
     lifespan=lifespan,
@@ -468,7 +468,7 @@ async def _embed_text(text: str) -> list[float]:
 
 def _build_system_prompt(graph_context: dict | None = None) -> str:
     parts = [
-        "You are EdinTech-RAG, an expert technical assistant for industrial "
+        "You are IndustryOrch, an expert technical assistant for industrial "
         "equipment documentation. Answer the user's question using the "
         "provided context from company documents and knowledge graph data. "
         "If the context does not contain sufficient information to answer fully, "

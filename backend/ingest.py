@@ -19,13 +19,13 @@ import shutil
 import time
 from pathlib import Path
 
-logger = logging.getLogger("edintech-ingest")
+logger = logging.getLogger("industryorch-ingest")
 
 
 def _get_db_url() -> str:
     return os.environ.get(
         "DATABASE_URL",
-        "postgresql://edintech:password@localhost:5432/edintechrag",
+        "postgresql://edintech:password@localhost:5432/industryorch",
     )
 
 
@@ -124,7 +124,7 @@ def ingest_directory(directory: str, category: str = "other") -> list[dict]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="EdinTech-RAG ingestion worker")
+    parser = argparse.ArgumentParser(description="IndustryOrch ingestion worker")
     parser.add_argument(
         "--dir",
         "-d",

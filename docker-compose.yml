@@ -4,7 +4,7 @@ services:
   # -----------------------------------------------------------------------
   neo4j:
     image: neo4j:5.23
-    container_name: edintech-neo4j
+    container_name: industryorch-neo4j
     network_mode: host
     restart: unless-stopped
     environment:
@@ -32,18 +32,18 @@ services:
   # -----------------------------------------------------------------------
   postgres:
     image: pgvector/pgvector:pg17
-    container_name: edintech-postgres
+    container_name: industryorch-postgres
     network_mode: host
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-edintech}
+      POSTGRES_USER: ${POSTGRES_USER:-industryorch}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
-      POSTGRES_DB:   ${POSTGRES_DB:-edintechrag}
+      POSTGRES_DB:   ${POSTGRES_DB:-industryorch}
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./supabase/20260505_init.sql:/docker-entrypoint-initdb.d/001_init.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-edintech} -d ${POSTGRES_DB:-edintechrag}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-industryorch} -d ${POSTGRES_DB:-industryorch}"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -54,7 +54,7 @@ services:
   # Requires MODEL_PATH and MODEL_FILE env vars pointing to a GGUF model.
   # -----------------------------------------------------------------------
   # llama-server:
-  #   container_name: edintech-llama
+  #   container_name: industryorch-llama
   #   restart: unless-stopped
   #   ports:
   #     - "${LLAMA_PORT:-8080}:8080"
@@ -73,7 +73,7 @@ services:
   #     - ollama
 
   # -----------------------------------------------------------------------
-  # EdinTech-RAG API server
+  # IndustryOrch API server
   # Generation backend controlled by GEN_BACKEND env var:
   #   - "ollama"      (default, uses Ollama chat endpoint)
   #   - "llama_cpp"   (uses llama.cpp /v1/chat/completions)
@@ -86,11 +86,11 @@ services:
       args:
         GLINER_MODEL: ${GLINER_MODEL:-urchade/gliner_medium-v2.1}
         HF_TOKEN: ${HF_TOKEN:-}
-    container_name: edintech-app
+    container_name: industryorch-app
     network_mode: host
     restart: unless-stopped
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-edintech}:${POSTGRES_PASSWORD:-password}@localhost:5432/${POSTGRES_DB:-edintechrag}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-industryorch}:${POSTGRES_PASSWORD:-password}@localhost:5432/${POSTGRES_DB:-industryorch}
       OLLAMA_URL:  http://localhost:11434
       EMBED_MODEL: ${EMBED_MODEL:-qwen3-embedding:0.6b}
       GEN_BACKEND: ${GEN_BACKEND:-ollama}
@@ -121,7 +121,7 @@ services:
     build:
       context: .
       dockerfile: frontend/Dockerfile
-    container_name: edintech-streamlit
+    container_name: industryorch-streamlit
     network_mode: host
     restart: unless-stopped
     environment:

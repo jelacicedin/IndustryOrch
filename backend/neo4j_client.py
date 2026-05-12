@@ -34,7 +34,7 @@ from typing import Any
 
 from neo4j import Driver, GraphDatabase
 
-logger = logging.getLogger("edintech-neo4j")
+logger = logging.getLogger("industryorch-neo4j")
 
 # ---------------------------------------------------------------------------
 # Configuration

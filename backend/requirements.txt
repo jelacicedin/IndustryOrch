@@ -1,4 +1,4 @@
-# EdinTech-RAG — Backend dependencies (Docker)
+# IndustryOrch — Backend dependencies (Docker)
 # ==============================================
 
 # Web framework

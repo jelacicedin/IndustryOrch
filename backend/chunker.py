@@ -29,7 +29,7 @@ from typing import Any, Callable
 import psycopg
 from psycopg import sql
 
-logger = logging.getLogger("edintech-ingest")
+logger = logging.getLogger("industryorch-ingest")
 
 # ---------------------------------------------------------------------------
 # Config from environment

@@ -1,5 +1,5 @@
 # Copyright (C) 2026  Edin Jelacic — AGPL-3.0-or-later
-"""EdinTech-RAG — Streamlit frontend for industrial document Q&A.
+"""IndustryOrch — Streamlit frontend for industrial document Q&A.
 
 Provides a chat interface to query ingested documents, upload files for
 ingestion, and manage the document corpus via the FastAPI backend.
@@ -49,7 +49,7 @@ STAGE_ICONS: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 st.set_page_config(
-    page_title="EdinTech-RAG",
+    page_title="IndustryOrch",
     page_icon="📄",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -428,7 +428,7 @@ with st.sidebar:
 # Main area — chat interface
 # ---------------------------------------------------------------------------
 
-st.title("EdinTech-RAG")
+st.title("IndustryOrch")
 st.caption("Ask questions about your ingested industrial documents.")
 
 # Query filters (collapsible)

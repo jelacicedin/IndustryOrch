@@ -1,4 +1,4 @@
-# EdinTech-RAG — Claude Instructions
+# IndustryOrch — Claude Instructions
 
 ## What this project is
 
@@ -21,9 +21,9 @@ Question → embed (Ollama) → hybrid_search() PL/pgSQL (RRF: vector + FTS)
 
 | Container | Port | Role |
 |-----------|------|------|
-| `edintech-postgres` | 5432 | PostgreSQL 17 + pgvector |
-| `edintech-app` | 8000 (APP_PORT) | FastAPI backend |
-| `edintech-streamlit` | 8501 | Streamlit frontend |
+| `industryorch-postgres` | 5432 | PostgreSQL 17 + pgvector |
+| `industryorch-app` | 8000 (APP_PORT) | FastAPI backend |
+| `industryorch-streamlit` | 8501 | Streamlit frontend |
 
 All services use `network_mode: host`. Ollama runs on the **host machine** at
 `localhost:11434` — it is NOT a Docker service.
@@ -45,7 +45,7 @@ All services use `network_mode: host`. Ollama runs on the **host machine** at
 
 ```
 GEN_BACKEND=ollama          # "ollama" or "llama_cpp"
-GENERATION_MODEL=rnj-1:8b  # Ollama model for generation
+GENERATION_MODEL=qwen3:14b  # Ollama model for generation
 EMBED_MODEL=qwen3-embedding:0.6b
 VISION_MODEL=               # Optional: Ollama vision model for PDF image description
 OLLAMA_THINK=true           # Enable extended thinking (auto-disabled if model rejects it)
@@ -70,7 +70,7 @@ docker compose logs -f app
 docker compose logs -f streamlit
 
 # Apply a DB migration to a running database
-docker exec -i edintech-postgres psql -U edintech edintechrag \
+docker exec -i industryorch-postgres psql -U industryorch industryorch \
   < supabase/20260506_fix_tsquery.sql
 
 # Check system health

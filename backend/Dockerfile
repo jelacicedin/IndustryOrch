@@ -1,4 +1,4 @@
-# EdinTech-RAG API server Dockerfile
+# IndustryOrch API server Dockerfile
 # ===================================
 
 FROM python:3.12-slim AS base

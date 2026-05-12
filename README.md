@@ -1,4 +1,4 @@
-# EdinTech-RAG
+# IndustryOrch
 
 Interactive technical document analyst app for industrial equipment documentation.
 
@@ -100,8 +100,8 @@ source .venv/bin/activate
 pip install -r ../requirements.txt
 
 # 3. Set up database (requires PostgreSQL with pgvector running)
-psql -U postgres -c "CREATE DATABASE edintechrag;"
-psql -U postgres -d edintechrag -f ../supabase/20260505_init.sql
+psql -U postgres -c "CREATE DATABASE industryorch;"
+psql -U postgres -d industryorch -f ../supabase/20260505_init.sql
 
 # 4. Start the API server
 uvicorn server:app --reload --port 8000
@@ -277,9 +277,9 @@ A PL/pgSQL function `hybrid_search()` implements RRF-based hybrid retrieval with
 
 | Variable             | Default                                          | Description                                      |
 |----------------------|--------------------------------------------------|--------------------------------------------------|
-| `POSTGRES_USER`      | `edintech`                                       | PostgreSQL username                              |
+| `POSTGRES_USER`      | `industryorch`                                       | PostgreSQL username                              |
 | `POSTGRES_PASSWORD`  | `password`                                       | PostgreSQL password                              |
-| `POSTGRES_DB`        | `edintechrag`                                    | Database name                                    |
+| `POSTGRES_DB`        | `industryorch`                                    | Database name                                    |
 | `OLLAMA_URL`         | `http://host.docker.internal:11434`              | Ollama API endpoint (embeddings + optional gen)  |
 | `EMBED_MODEL`        | `qwen3-embedding:0.6b`                           | Embedding model                                  |
 | `GENERATION_MODEL`   | `qwen3.6:27b`                                    | Ollama generation model (only when ollama backend) |
@@ -291,7 +291,7 @@ A PL/pgSQL function `hybrid_search()` implements RRF-based hybrid retrieval with
 ## Project Structure
 
 ```
-EdinTech-RAG/
+IndustryOrch/
 ├── backend/
 │   ├── converter.py      # PDF/XLSX/CSV → Markdown conversion
 │   ├── chunker.py        # Markdown → Chunks + Embeddings

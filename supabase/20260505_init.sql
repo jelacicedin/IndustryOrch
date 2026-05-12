@@ -1,5 +1,5 @@
 -- ============================================================
--- EdinTech RAG — industrial document migration
+-- IndustryOrch — industrial document migration
 -- ============================================================
 
 -- 1. Enable pgvector

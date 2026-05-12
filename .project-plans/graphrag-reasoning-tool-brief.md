@@ -1,12 +1,12 @@
 # GraphRAG Reasoning Tool — Project Brief
 
-> **Origin**: This project was planned based on research and conversation starting from the EdinTech-RAG repo (`/home/edinj/repos/EdinTech-RAG`). Use this file as a reference when scaffolding the new repo.
+> **Origin**: This project was planned based on research and conversation starting from the IndustryOrch repo (`/home/edinj/repos/IndustryOrch`). Use this file as a reference when scaffolding the new repo.
 
 ---
 
 ## What This Is
 
-A full-featured, agentic tech document reasoning tool — not just retrieval, but **reasoning about connections** between data snippets using knowledge graphs, multi-agent orchestration, and long-term memory. Built as a successor/inspiration from EdinTech-RAG.
+A full-featured, agentic tech document reasoning tool — not just retrieval, but **reasoning about connections** between data snippets using knowledge graphs, multi-agent orchestration, and long-term memory. Built as a successor/inspiration from IndustryOrch.
 
 ---
 
@@ -78,7 +78,7 @@ A full-featured, agentic tech document reasoning tool — not just retrieval, bu
 │  neo4j-graphrag-python for extraction pipeline    │
 ├─────────────────────────────────────────────────┤
 │  Vector Store: PostgreSQL + pgvector             │
-│  (keep from EdinTech-RAG — it works well)         │
+│  (keep from IndustryOrch — it works well)         │
 ├─────────────────────────────────────────────────┤
 │  LLMs: Ollama (local) + OpenRouter fallback      │
 │  Generation + Extraction + Reranking              │
@@ -131,7 +131,7 @@ Then iteratively add: code sandbox, graph visualization, profile memory, templat
 
 - **GraphRAG over pure vector**: Industrial documents have structured relationships (machine A connects to valve B) that semantic search alone can't capture. Graph traversal enables multi-hop reasoning.
 - **LangGraph supervisor pattern**: More reliable than free-form agent-to-agent calls, less complex than deep hierarchies. Deterministic termination conditions prevent infinite loops.
-- **Keep PostgreSQL + pgvector**: Already works well in EdinTech-RAG. Use for vector storage; add Neo4j (or graph tables) on top for relationships.
+- **Keep PostgreSQL + pgvector**: Already works well in IndustryOrch. Use for vector storage; add Neo4j (or graph tables) on top for relationships.
 - **Local-first (Ollama)**: Privacy-preserving, no API costs. Accept SLM trade-off on complex reasoning tasks.
 - **Next.js over Streamlit**: Better UX for a production tool. Shadcn UI provides polished components. Tauri optional for desktop distribution.
 
@@ -149,4 +149,4 @@ Then iteratively add: code sandbox, graph visualization, profile memory, templat
 
 ---
 
-*Created from conversation starting at EdinTech-RAG on 2026-05-12.*
+*Created from conversation starting at IndustryOrch on 2026-05-12.*
