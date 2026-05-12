@@ -31,8 +31,16 @@ import httpx
 import ollama
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from starlette.responses import StreamingResponse
 from pydantic import BaseModel, Field
+
+# ---------------------------------------------------------------------------
+# Neo4j graph client (lazy init)
+# ---------------------------------------------------------------------------
+from neo4j_client import (
+    get_graph_db,
+    init_graph_db,
+    close_graph_db,
+)  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -47,6 +55,9 @@ embed_model = os.environ.get("EMBED_MODEL", "qwen3-embedding:0.6b")
 
 # Generation backend: "ollama" or "llama_cpp"
 gen_backend = os.environ.get("GEN_BACKEND", "ollama").lower().strip()
+
+# Neo4j URI (for graph extraction and queries)
+NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
 
 # Ollama generation config (used when GEN_BACKEND=ollama)
 gen_model = os.environ.get("GENERATION_MODEL", "qwen3.6:27b")
@@ -110,11 +121,18 @@ class Filters(BaseModel):
     location: str | None = None
 
 
+class HistoryMessage(BaseModel):
+    role: str  # "user" or "assistant"
+    content: str
+
+
 class QueryRequest(BaseModel):
     question: str
     filters: Filters = Field(default_factory=Filters)
     top_k: int = 5
     show_thinking: bool = False
+    use_graph: bool = True
+    history: list[HistoryMessage] = Field(default_factory=list)
 
 
 class Source(BaseModel):
@@ -129,7 +147,8 @@ class Source(BaseModel):
 class QueryResponse(BaseModel):
     answer: str
     thinking: str | None = None
-    sources: list[Source]
+    sources: list[Source] = []
+    graph_context: GraphContext | None = None  # Populated when use_graph=True
 
 
 class DocumentInfo(BaseModel):
@@ -145,14 +164,49 @@ class DocumentInfo(BaseModel):
     chunk_count: int
 
 
+# ---------------------------------------------------------------------------
+# Graph-related models
+# ---------------------------------------------------------------------------
+
+
+class GraphNode(BaseModel):
+    name: str
+    type: str
+    attributes: dict = {}
+
+
+class GraphEdge(BaseModel):
+    source: str
+    target: str
+    type: str
+    attributes: dict = {}
+
+
+class GraphContext(BaseModel):
+    center: GraphNode | None = None
+    neighbors: list[GraphNode] = []
+    edges: list[GraphEdge] = []
+
+
+class GraphQueryResponse(BaseModel):
+    question: str
+    answer: str
+    thinking: str | None = None
+    sources: list[Source] = []
+    graph_context: GraphContext | None = None
+
+
 class HealthStatus(BaseModel):
     postgres_ok: bool
+    neo4j_ok: bool
     ollama_ok: bool
     embed_model_available: bool
     generation_backend: str
     generation_ok: bool
     total_documents: int
     total_chunks: int
+    total_graph_entities: int = 0
+    total_graph_relationships: int = 0
     message: str
 
 
@@ -167,12 +221,13 @@ async def lifespan(app: FastAPI):
     await _verify_startup()
     logger.info("EdinTech-RAG server started successfully (backend=%s).", gen_backend)
     yield
+    close_graph_db()
     await _close_pool()
     logger.info("EdinTech-RAG server shutting down.")
 
 
 async def _verify_startup() -> None:
-    """Check PostgreSQL and generation backend connectivity."""
+    """Check PostgreSQL, Neo4j, and generation backend connectivity."""
     # --- PostgreSQL ---
     try:
         pool = await _get_pool()
@@ -184,6 +239,18 @@ async def _verify_startup() -> None:
         raise RuntimeError(
             f"Cannot connect to PostgreSQL at {env_db_url}: {exc}"
         ) from exc
+
+    # --- Neo4j ---
+    try:
+        init_graph_db()
+        stats = get_graph_db().get_relationship_stats()
+        logger.info(
+            "Neo4j connected — %d entities, %d relationships",
+            stats["total_entities"],
+            stats["total_relationships"],
+        )
+    except Exception as exc:
+        logger.warning("Neo4j not reachable at %s — graph features disabled: %s", NEO4J_URI, exc)
 
     # --- Embedding backend (always Ollama) ---
     try:
@@ -212,6 +279,14 @@ async def _verify_startup() -> None:
             logger.error(
                 "llama.cpp server not reachable at %s — %s", llama_server_url, exc
             )
+
+    # --- GLiNER warmup (used for both query-time NER and NLP-path ingest) ---
+    try:
+        from graph_extractor import _get_gliner, GLINER_MODEL as _gliner_model
+        await asyncio.get_running_loop().run_in_executor(None, _get_gliner)
+        logger.info("GLiNER model ready: %s", _gliner_model)
+    except Exception as exc:
+        logger.warning("GLiNER warmup failed — graph search will load on first use: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +374,83 @@ async def _hybrid_search(
 
 
 # ---------------------------------------------------------------------------
+# Graph-enhanced retrieval
+# ---------------------------------------------------------------------------
+
+
+async def _graph_search(question: str, depth: int = 2) -> dict | None:
+    """Extract entities from the question and traverse the knowledge graph.
+
+    Uses GLiNER for zero-shot NER on the question — no gen-model round-trip,
+    no extra VRAM pressure. Returns center + neighbors + edges for prompt injection.
+    """
+    try:
+        client = get_graph_db()
+    except RuntimeError:
+        logger.debug("Neo4j not available — skipping graph search")
+        return None
+
+    # Extract entity names from the question using GLiNER (fast, CPU, in-process)
+    entities: list[str] = []
+    try:
+        from graph_extractor import _get_gliner, ENTITY_TYPES, GLINER_THRESHOLD
+        gliner = _get_gliner()
+        spans = gliner.predict_entities(
+            question, ENTITY_TYPES, threshold=GLINER_THRESHOLD
+        )
+        seen: set[str] = set()
+        for span in spans:
+            name = span["text"].strip()
+            if name and name not in seen:
+                entities.append(name)
+                seen.add(name)
+    except Exception as exc:
+        logger.warning("GLiNER entity extraction from question failed: %s", exc)
+
+    if not entities:
+        logger.debug("No entities found in question — skipping graph search")
+        return None
+
+    logger.info("Graph search: extracted entities %s", entities)
+
+    # Traverse the graph for each entity and merge results
+    all_neighbors: dict = {}
+    all_edges: list = []
+    center_entity = None
+
+    for entity_name in entities[:3]:
+        try:
+            graph_ctx = client.get_entity_connections(entity_name, depth=depth)
+            if not center_entity and graph_ctx.get("center"):
+                center_entity = graph_ctx["center"]
+            for n in graph_ctx.get("neighbors", []):
+                n_name = n["name"]
+                if n_name not in all_neighbors:
+                    all_neighbors[n_name] = n
+            seen_edges = {
+                (e["source"], e["target"], e["type"]) for e in all_edges
+            }
+            for e in graph_ctx.get("edges", []):
+                key = (e["source"], e["target"], e["type"])
+                if key not in seen_edges:
+                    all_edges.append(e)
+                    seen_edges.add(key)
+        except Exception as exc:
+            logger.debug(
+                "Graph lookup failed for '%s': %s", entity_name, exc
+            )
+
+    if not all_neighbors and not center_entity:
+        return None
+
+    return {
+        "center": center_entity,
+        "neighbors": list(all_neighbors.values()),
+        "edges": all_edges,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Embedding helper (always Ollama)
 # ---------------------------------------------------------------------------
 
@@ -314,18 +466,44 @@ async def _embed_text(text: str) -> list[float]:
 # ---------------------------------------------------------------------------
 
 
-def _build_system_prompt() -> str:
-    return (
+def _build_system_prompt(graph_context: dict | None = None) -> str:
+    parts = [
         "You are EdinTech-RAG, an expert technical assistant for industrial "
-        "equipment documentation. Answer the user's question using ONLY the "
-        "provided context from company documents. If the context does not "
-        "contain sufficient information to answer fully, say so clearly and "
-        "list what information is missing. Always cite your sources by filename "
-        "and section heading. Be precise, technical, and concise."
-    )
+        "equipment documentation. Answer the user's question using the "
+        "provided context from company documents and knowledge graph data. "
+        "If the context does not contain sufficient information to answer fully, "
+        "say so clearly and list what information is missing. Always cite your "
+        "sources by filename and section heading. Be precise, technical, and concise.",
+    ]
+
+    if graph_context:
+        center = graph_context.get("center")
+        neighbors = graph_context.get("neighbors", [])
+        edges = graph_context.get("edges", [])
+        if center or neighbors or edges:
+            lines = ["\n\nKnowledge Graph Context:"]
+            if center:
+                lines.append(
+                    f"  Center entity: {center['name']} ({center['type']})"
+                )
+            for n in neighbors:
+                lines.append(f"  - {n['name']} ({n['type']})")
+            if edges:
+                lines.append("  Relationships:")
+                for e in edges:
+                    lines.append(
+                        f"    {e['source']} --[{e['type']}]--> {e['target']}"
+                    )
+            parts.append("\n".join(lines))
+
+    return "\n".join(parts)
 
 
-def _build_user_prompt(question: str, sources: list[dict[str, Any]]) -> str:
+def _build_user_prompt(
+    question: str,
+    sources: list[dict[str, Any]],
+    graph_context: dict | None = None,
+) -> str:
     context_parts = []
     for i, src in enumerate(sources):
         context_parts.append(
@@ -335,17 +513,33 @@ def _build_user_prompt(question: str, sources: list[dict[str, Any]]) -> str:
         )
     context = "\n\n---\n\n".join(context_parts)
 
-    return (
-        f"Question: {question}\n\n"
-        f"Relevant document excerpts:\n\n{context}\n\n"
-        "Provide a clear, technical answer based on the excerpts above."
-    )
+    parts = [
+        f"Question: {question}",
+    ]
+
+    if sources:
+        parts.append(f"Relevant document excerpts:\n\n{context}")
+
+    if graph_context:
+        neighbors = graph_context.get("neighbors", [])
+        edges = graph_context.get("edges", [])
+        if neighbors or edges:
+            graph_text = "Knowledge graph relationships relevant to your question:\n"
+            for e in edges:
+                attrs_str = f" ({json.dumps(e.get('attributes', {}), default=str)})" if e.get("attributes") else ""
+                graph_text += f"  {e['source']} --[{e['type']}]--> {e['target']}{attrs_str}\n"
+            parts.append(graph_text)
+
+    parts.append("Provide a clear, technical answer based on the excerpts and relationships above.")
+
+    return "\n\n".join(parts)
 
 
 async def _generate_with_ollama(
     system_prompt: str,
     user_prompt: str,
     show_thinking: bool = False,
+    history: list[dict] | None = None,
 ) -> tuple[str, str | None]:
     """Generate an answer using Ollama with optional extended thinking.
 
@@ -353,12 +547,14 @@ async def _generate_with_ollama(
     retried automatically without think=True and the model is remembered so
     subsequent queries skip the think parameter from the start.
     """
-    use_thinking = (show_thinking or ollama_think) and gen_model not in _no_think_models
+    use_thinking = (
+        (show_thinking or ollama_think) and gen_model not in _no_think_models
+    )
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
+    messages: list[dict] = [{"role": "system", "content": system_prompt}]
+    if history:
+        messages.extend(history)
+    messages.append({"role": "user", "content": user_prompt})
 
     def _do_chat(think: bool) -> Any:
         return ollama.chat(
@@ -407,6 +603,7 @@ async def _generate_with_llama_cpp(
     system_prompt: str,
     user_prompt: str,
     show_thinking: bool = False,
+    history: list[dict] | None = None,
 ) -> tuple[str, str | None]:
     """Generate an answer using llama.cpp server (OpenAI-compatible API).
 
@@ -414,12 +611,14 @@ async def _generate_with_llama_cpp(
     the OpenAI Python client. We use httpx directly to avoid adding another
     dependency for the optional backend.
     """
-    system_msg = {"role": "system", "content": system_prompt}
-    user_msg = {"role": "user", "content": user_prompt}
+    messages: list[dict] = [{"role": "system", "content": system_prompt}]
+    if history:
+        messages.extend(history)
+    messages.append({"role": "user", "content": user_prompt})
 
     payload = {
         "model": "",  # llama-server ignores model name on single-model instances
-        "messages": [system_msg, user_msg],
+        "messages": messages,
         "temperature": 0.1,
         "max_tokens": 4096,
         "top_k": 20,
@@ -467,7 +666,7 @@ _GENERATORS = {
 
 @app.get("/health", response_model=HealthStatus)
 async def health():
-    """Health check — verifies PostgreSQL and generation backend."""
+    """Health check — verifies PostgreSQL, Neo4j, and generation backend."""
     postgres_ok = False
     total_documents = 0
     total_chunks = 0
@@ -478,6 +677,19 @@ async def health():
             total_documents = await conn.fetchval("SELECT COUNT(*) FROM documents")
             total_chunks = await conn.fetchval("SELECT COUNT(*) FROM chunks")
         postgres_ok = True
+    except Exception:
+        pass
+
+    neo4j_ok = False
+    total_graph_entities = 0
+    total_graph_relationships = 0
+
+    try:
+        client = get_graph_db()
+        stats = client.get_relationship_stats()
+        neo4j_ok = True
+        total_graph_entities = stats["total_entities"]
+        total_graph_relationships = stats["total_relationships"]
     except Exception:
         pass
 
@@ -515,15 +727,23 @@ async def health():
         except Exception:
             pass
 
-    status = "healthy" if (postgres_ok and gen_ok) else "degraded"
+    status = "healthy"
+    if not postgres_ok or not gen_ok:
+        status = "degraded"
+    elif not neo4j_ok:
+        status = "degraded (graph unavailable)"
+
     return HealthStatus(
         postgres_ok=postgres_ok,
+        neo4j_ok=neo4j_ok,
         ollama_ok=ollama_ok,
         embed_model_available=embed_available,
         generation_backend=gen_backend,
         generation_ok=gen_ok,
         total_documents=total_documents,
         total_chunks=total_chunks,
+        total_graph_entities=total_graph_entities,
+        total_graph_relationships=total_graph_relationships,
         message=status,
     )
 
@@ -532,9 +752,9 @@ async def health():
 async def query(request: QueryRequest):
     """Ask a question against the document corpus.
 
-    Performs hybrid search (semantic + keyword via RRF), then generates an
-    answer using the configured generation backend with optional extended
-    thinking mode.
+    Performs hybrid search (semantic + keyword via RRF), optionally augmented
+    with graph traversal, then generates an answer using the configured
+    generation backend with optional extended thinking mode.
     """
     if not request.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty")
@@ -548,7 +768,7 @@ async def query(request: QueryRequest):
             detail=f"Embedding failed: {exc}",
         ) from exc
 
-    # Step 2: Hybrid search
+    # Step 2: Hybrid search (vector + FTS via RRF)
     try:
         sources = await _hybrid_search(
             query_text=_sanitize_query_text(request.question),
@@ -560,9 +780,23 @@ async def query(request: QueryRequest):
         logger.error("Hybrid search failed: %s", exc)
         raise HTTPException(status_code=503, detail=f"Search failed: {exc}") from exc
 
-    if not sources:
+    # Step 2b: Graph-enhanced retrieval (optional)
+    graph_context = None
+    if request.use_graph:
+        try:
+            graph_context = await _graph_search(request.question, depth=2)
+            if graph_context:
+                logger.info(
+                    "Graph search returned %d neighbors for '%s'",
+                    len(graph_context.get("neighbors", [])),
+                    request.question[:50],
+                )
+        except Exception as exc:
+            logger.warning("Graph search failed (continuing with vector only): %s", exc)
+
+    if not sources and not graph_context:
         return QueryResponse(
-            answer="No relevant documents found for your question.",
+            answer="No relevant documents or graph connections found for your question.",
             sources=[],
         )
 
@@ -576,10 +810,14 @@ async def query(request: QueryRequest):
         )
 
     try:
-        system_prompt = _build_system_prompt()
-        user_prompt = _build_user_prompt(request.question, sources)
+        system_prompt = _build_system_prompt(graph_context)
+        user_prompt = _build_user_prompt(request.question, sources, graph_context)
+        history = [{"role": m.role, "content": m.content} for m in request.history]
         answer, thinking = await gen_fn(
-            system_prompt, user_prompt, show_thinking=request.show_thinking
+            system_prompt,
+            user_prompt,
+            show_thinking=request.show_thinking,
+            history=history or None,
         )
     except Exception as exc:
         logger.error("Generation failed (%s): %s", gen_backend, exc)
@@ -591,7 +829,98 @@ async def query(request: QueryRequest):
         answer=answer,
         thinking=thinking if request.show_thinking else None,
         sources=[Source(**s) for s in sources],
+        graph_context=graph_context,
     )
+
+
+# ---------------------------------------------------------------------------
+# Graph endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/graph/stats")
+def graph_stats():
+    """Get knowledge graph statistics."""
+    try:
+        client = get_graph_db()
+        return client.get_relationship_stats()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error("Graph stats failed: %s", exc)
+        raise HTTPException(status_code=503, detail=f"Graph query failed: {exc}") from exc
+
+
+@app.get("/graph/entity/{entity_name}")
+def get_entity(entity_name: str):
+    """Get a single entity by name with its full attributes."""
+    try:
+        client = get_graph_db()
+        entity = client.get_entity(entity_name)
+        if entity is None:
+            raise HTTPException(status_code=404, detail=f"Entity not found: {entity_name}")
+        return entity
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Entity lookup failed: %s", exc)
+        raise HTTPException(status_code=503, detail=f"Graph query failed: {exc}") from exc
+
+
+@app.get("/graph/entity/{entity_name}/connections")
+def get_entity_connections(
+    entity_name: str,
+    depth: int = 2,
+):
+    """Get all entities connected to a given entity (multi-hop)."""
+    try:
+        client = get_graph_db()
+        return client.get_entity_connections(entity_name, depth=depth)
+    except Exception as exc:
+        logger.error("Entity connections failed: %s", exc)
+        raise HTTPException(status_code=503, detail=f"Graph query failed: {exc}") from exc
+
+
+@app.post("/graph/traverse")
+def graph_traverse(
+    start: str = Form(...),
+    rel_type: str | None = Form(default=None),
+    depth: int = Form(default=3),
+):
+    """Find all paths from a starting entity.
+
+    Useful for multi-hop questions like 'what does coolant pump CP-101 feed?'
+    """
+    try:
+        client = get_graph_db()
+        paths = client.multi_hop_traversal(start, rel_type=rel_type, depth=depth)
+        return {"start": start, "paths": paths}
+    except Exception as exc:
+        logger.error("Graph traversal failed: %s", exc)
+        raise HTTPException(status_code=503, detail=f"Graph query failed: {exc}") from exc
+
+
+@app.get("/graph/entities/{etype}")
+def get_entities_by_type(etype: str, limit: int = 100):
+    """Get all entities of a given type."""
+    try:
+        client = get_graph_db()
+        return client.get_nodes_by_type(etype, limit=limit)
+    except Exception as exc:
+        logger.error("Entity type lookup failed: %s", exc)
+        raise HTTPException(status_code=503, detail=f"Graph query failed: {exc}") from exc
+
+
+@app.post("/graph/clear")
+def clear_graph():
+    """Delete all nodes and relationships. Destructive — requires confirmation."""
+    try:
+        client = get_graph_db()
+        client.clear_graph()
+        return {"message": "Graph cleared successfully"}
+    except Exception as exc:
+        logger.error("Graph clear failed: %s", exc)
+        raise HTTPException(status_code=503, detail=f"Graph clear failed: {exc}") from exc
 
 
 @app.get("/documents", response_model=list[DocumentInfo])
@@ -728,7 +1057,6 @@ async def ingest_document(
     Accepts a file plus optional metadata fields. Returns a job ID that
     can be polled for progress via GET /ingest/status/{job_id}.
     """
-    import io
     import threading
     import uuid
 
@@ -846,6 +1174,36 @@ async def ingest_document(
             finally:
                 db.close()
 
+            # --- Graph extraction (runs after DB insert, doesn't block it) ---
+            try:
+                from graph_extractor import extract_graph_from_markdown  # noqa: E402
+
+                _ingest_progress[job_id]["stage"] = "graph_extraction"
+                _ingest_progress[job_id][
+                    "message"
+                ] = f"Building knowledge graph for **{file.filename}** …"
+                logger.info("[ingest] Graph extraction for %s", file.filename)
+
+                result = extract_graph_from_markdown(markdown)
+
+                # Upsert into Neo4j
+                client = get_graph_db()
+                client.merge_entities(result.entities)
+                client.merge_relationships(result.relationships)
+                logger.info(
+                    "[ingest] Graph: %d entities, %d relationships for %s",
+                    len(result.entities),
+                    len(result.relationships),
+                    file.filename,
+                )
+            except Exception as exc:
+                # Graph extraction failure doesn't block ingestion
+                logger.warning(
+                    "[ingest] Graph extraction failed for %s (doc still ingested): %s",
+                    file.filename,
+                    exc,
+                )
+
         finally:
             if tmp_path:
                 Path(tmp_path).unlink(missing_ok=True)
@@ -894,9 +1252,18 @@ def get_ingest_status(job_id: str):
         if m:
             batch_end = int(m.group(2))
             total_ch = int(m.group(3))
-            progress = int(50 + (batch_end / total_ch) * 45)
+            progress = int(50 + (batch_end / total_ch) * 40)
         else:
             progress = 50
+    elif stage == "graph_extraction":
+        # Parse "Extracting batch X/Y" or "Extracting (NLP) chunk X/Y"
+        m = re.search(r"(\d+)/(\d+)", message)
+        if m:
+            cur = int(m.group(1))
+            total = int(m.group(2))
+            progress = int(92 + (cur / total) * 7)
+        else:
+            progress = 92
     else:
         progress = 2
 

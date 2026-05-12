@@ -75,12 +75,13 @@ def _dataframe_to_md(df: pd.DataFrame) -> str:
         "| " + " | ".join("---" for _ in headers) + " |",
     ]
     for _, row in df.iterrows():
-        lines.append("| " + " | ".join(_escape_md_cell(v) for v in row.values) + " |")
+        cells = " | ".join(_escape_md_cell(v) for v in row.values)
+        lines.append("| " + cells + " |")
     return "\n".join(lines)
 
 
 def _plumber_table_to_md(table: list[list]) -> str:
-    """Convert a pdfplumber table (list of rows, each row a list of cells) to markdown."""
+    """Convert a pdfplumber table to markdown."""
     if not table or not table[0]:
         return ""
     header = [_escape_md_cell(c) for c in table[0]]
@@ -100,7 +101,9 @@ def _plumber_table_to_md(table: list[list]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _describe_image(img_bytes: bytes) -> str | None:
+def _describe_image(
+    img_bytes: bytes, keep_alive: str | int = "5m"
+) -> str | None:
     """Describe an image using the configured Ollama vision model."""
     if not VISION_MODEL:
         return None
@@ -113,16 +116,33 @@ def _describe_image(img_bytes: bytes) -> str | None:
                 {
                     "role": "user",
                     "content": (
-                        "Describe this technical diagram, chart, or image concisely. "
-                        "Focus on labels, measurements, data values, and what it depicts."
+                        "Describe this technical diagram, chart, or image "
+                        "concisely. Focus on labels, measurements, data "
+                        "values, and what it depicts."
                     ),
                     "images": [base64.b64encode(img_bytes).decode()],
                 }
             ],
+            keep_alive=keep_alive,
         )
-        return resp["message"]["content"].strip()
+        return resp.message.content.strip()
     except Exception:
         return None
+
+
+def _evict_vision_model() -> None:
+    """Evict the vision model from VRAM after all images are processed.
+
+    Prevents the vision model and the graph extraction / generation model
+    from occupying VRAM simultaneously.
+    """
+    if not VISION_MODEL:
+        return
+    try:
+        import ollama
+        ollama.generate(model=VISION_MODEL, prompt="", keep_alive=0)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -151,19 +171,25 @@ def _convert_pdf(
     doc = fitz.open(file_path)
     page_count = len(doc)
     md_parts: list[str] = []
+    images_described = False
 
     with pdfplumber.open(file_path) as pdf:
         for page_idx in range(page_count):
             if progress_callback:
-                progress_callback(f"Converting page {page_idx + 1}/{page_count} …")
+                progress_callback(
+                    f"Converting page {page_idx + 1}/{page_count} …"
+                )
 
             fitz_page = doc[page_idx]
             plumb_page = pdf.pages[page_idx]
 
-            heading = f"## Page {page_idx + 1}" if page_count > 1 else f"# {title}"
+            if page_count > 1:
+                heading = f"## Page {page_idx + 1}"
+            else:
+                heading = f"# {title}"
             section: list[str] = [heading]
 
-            # Text via PyMuPDF — significantly faster than pdfplumber for plain text
+            # Text via PyMuPDF — faster than pdfplumber for plain text
             text = fitz_page.get_text("text") or ""
             if text.strip():
                 section.append(f"### Text\n\n{text.strip()}")
@@ -175,7 +201,11 @@ def _convert_pdf(
                 for t_idx, table in valid:
                     md = _plumber_table_to_md(table)
                     if md:
-                        label = f"### Table {t_idx}" if len(valid) > 1 else "### Table"
+                        label = (
+                            f"### Table {t_idx}"
+                            if len(valid) > 1
+                            else "### Table"
+                        )
                         section.append(f"{label}\n\n{md}")
 
             # Images via PyMuPDF
@@ -187,13 +217,16 @@ def _convert_pdf(
                     info = doc.extract_image(xref)
                     w, h = info.get("width", 0), info.get("height", 0)
                     if w < _MIN_IMG_WIDTH or h < _MIN_IMG_HEIGHT:
-                        continue  # skip tiny decorative images
+                        continue
                     desc = _describe_image(info["image"])
                     if desc:
-                        img_parts.append(f"**[Figure {img_num}]** ({w}×{h}px): {desc}")
+                        images_described = True
+                        img_parts.append(
+                            f"**[Figure {img_num}]** ({w}×{h}px): {desc}"
+                        )
                     else:
                         hint = (
-                            " Set VISION_MODEL env var for automatic descriptions."
+                            " Set VISION_MODEL to enable descriptions."
                             if not VISION_MODEL
                             else ""
                         )
@@ -211,6 +244,10 @@ def _convert_pdf(
             md_parts.append("---")
 
     doc.close()
+
+    # Free vision model VRAM before graph extraction / generation loads
+    if images_described:
+        _evict_vision_model()
 
     full_md = "\n\n".join(md_parts)
     first_dates = _find_first_dates(full_md)
@@ -249,7 +286,9 @@ def _convert_xlsx(
 
     for sheet_idx, sheet_name in enumerate(wb.sheetnames, start=1):
         if progress_callback:
-            progress_callback(f"Converting sheet {sheet_idx}/{total}: {sheet_name} …")
+            progress_callback(
+                f"Converting sheet {sheet_idx}/{total}: {sheet_name} …"
+            )
 
         ws = wb[sheet_name]
         sheet_names.append(sheet_name)

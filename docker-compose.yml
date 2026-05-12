@@ -1,5 +1,33 @@
 services:
   # -----------------------------------------------------------------------
+  # Neo4j — knowledge graph store
+  # -----------------------------------------------------------------------
+  neo4j:
+    image: neo4j:5.23
+    container_name: edintech-neo4j
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-industryorch2026}
+      NEO4J_PLUGINS: '["graph-data-science"]'
+      NEO4J_apoc_export_file_enabled: "true"
+      NEO4J_apoc_import_file_enabled: "true"
+      NEO4J_apoc_import_file_use__neo4j__config: "true"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      - neo4j_import:/import
+      - neo4j_plugins:/plugins
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u ${NEO4J_USER:-neo4j} -p ${NEO4J_PASSWORD:-industryorch2026} 'RETURN 1' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+    ports:
+      - "7474:7474"   # Browser UI (local dev only)
+      - "7687:7687"   # Bolt protocol
+
+  # -----------------------------------------------------------------------
   # PostgreSQL + pgvector
   # -----------------------------------------------------------------------
   postgres:
@@ -55,6 +83,9 @@ services:
       context: ./backend
       network: host
       dockerfile: Dockerfile
+      args:
+        GLINER_MODEL: ${GLINER_MODEL:-urchade/gliner_medium-v2.1}
+        HF_TOKEN: ${HF_TOKEN:-}
     container_name: edintech-app
     network_mode: host
     restart: unless-stopped
@@ -63,13 +94,24 @@ services:
       OLLAMA_URL:  http://localhost:11434
       EMBED_MODEL: ${EMBED_MODEL:-qwen3-embedding:0.6b}
       GEN_BACKEND: ${GEN_BACKEND:-ollama}
-      GENERATION_MODEL: ${GENERATION_MODEL:-qwen3.6:27b}
+      GENERATION_MODEL: ${GENERATION_MODEL:-qwen3:14b}
       OLLAMA_THINK: ${OLLAMA_THINK:-true}
       LLAMA_SERVER_URL: ${LLAMA_SERVER_URL:-http://localhost:8080}
       VISION_MODEL: ${VISION_MODEL:-}
       APP_PORT: ${APP_PORT:-8001}
+      NEO4J_URI: ${NEO4J_URI:-bolt://localhost:7687}
+      NEO4J_USER: ${NEO4J_USER:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-industryorch2026}
+      GRAPH_EXTRACTION_MODEL: ${GRAPH_EXTRACTION_MODEL:-qwen2.5:1.5b}
+      GRAPH_USE_LLM: ${GRAPH_USE_LLM:-false}
+      GLINER_MODEL: ${GLINER_MODEL:-urchade/gliner_medium-v2.1}
+      GRAPH_NLP_MODEL: ${GRAPH_NLP_MODEL:-en_core_web_sm}
+      GLINER_THRESHOLD: ${GLINER_THRESHOLD:-0.4}
+      HF_TOKEN: ${HF_TOKEN:-}
     depends_on:
       postgres:
+        condition: service_healthy
+      neo4j:
         condition: service_healthy
 
   # -----------------------------------------------------------------------
@@ -93,3 +135,7 @@ services:
 
 volumes:
   pgdata:
+  neo4j_data:
+  neo4j_logs:
+  neo4j_import:
+  neo4j_plugins:

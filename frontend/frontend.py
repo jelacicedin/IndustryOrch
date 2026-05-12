@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import time
 from typing import Any
 
 import httpx
@@ -37,6 +36,13 @@ CATEGORIES = [
 ]
 
 FILE_TYPES = ["", "pdf", "xlsx", "csv", "md", "txt"]
+
+STAGE_ICONS: dict[str, str] = {
+    "converting": "🔄",
+    "inserting": "💾",
+    "chunking": "🧩",
+    "graph_extraction": "🕸️",
+}
 
 # ---------------------------------------------------------------------------
 # Page setup
@@ -63,6 +69,7 @@ def _init_session() -> None:
         "filter_document_category": "",
         "filter_location": "",
         "filter_top_k": 5,
+        "use_graph": True,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -152,6 +159,7 @@ def _poll_jobs() -> bool:
             job["status"] = data.get("status", job["status"])
             job["message"] = data.get("message", job["message"])
             job["progress"] = data.get("progress", job["progress"])
+            job["stage"] = data.get("stage", job.get("stage"))
             if data.get("result"):
                 job["result"] = data["result"]
         except Exception as exc:
@@ -165,21 +173,27 @@ def _render_job_progress(job_id: str, job: dict) -> None:
     message = job["message"]
     progress = job.get("progress", 0)
     filename = job["filename"]
+    stage = job.get("stage")
 
-    # Stage icon
-    icon = {"complete": "✅", "error": "❌", "queued": "⏳"}.get(status, "⚙️")
+    if status == "complete":
+        icon = "✅"
+    elif status == "error":
+        icon = "❌"
+    elif status == "queued":
+        icon = "⏳"
+    else:
+        icon = STAGE_ICONS.get(stage or "", "⚙️")
 
     st.markdown(f"**{icon} {filename}**")
 
     if status == "complete":
         result = job.get("result") or {}
         chunks = result.get("chunks", "?")
-        st.caption(f"Done — {chunks} chunks ingested")
+        st.caption(f"Done — {chunks} chunks + graph entities ingested")
     elif status == "error":
         st.caption(f"Error: {message}")
     else:
         st.progress(progress / 100)
-        # Clean up markdown bold markers from backend message for sidebar display
         clean_msg = re.sub(r"\*\*([^*]+)\*\*", r"\1", message)
         st.caption(clean_msg)
 
@@ -200,11 +214,16 @@ def _render_documents() -> None:
         st.caption("No documents ingested yet.")
         return
 
+    total_chunks = sum(d.get("chunk_count", 0) for d in docs)
+    st.caption(f"{len(docs)} document(s) · {total_chunks} total chunks")
+    st.markdown("---")
+
     for d in docs:
         col1, col2 = st.columns([5, 1])
         with col1:
+            eq = f" · {d['equipment_id']}" if d.get("equipment_id") else ""
             st.caption(
-                f"**{d['filename']}** ({d['document_category']}) — "
+                f"**{d['filename']}** `{d['document_category']}`{eq} — "
                 f"{d['chunk_count']} chunks"
             )
         with col2:
@@ -218,6 +237,60 @@ def _render_documents() -> None:
                 except Exception as exc:
                     st.toast(f"Error: {exc}", icon="❌")
                 st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Chat rendering helpers
+# ---------------------------------------------------------------------------
+
+
+def _render_graph_context(gc: dict) -> None:
+    """Render a knowledge graph context block."""
+    edges = gc.get("edges", [])
+    neighbors = gc.get("neighbors", [])
+    center = gc.get("center")
+    if not edges and not neighbors:
+        return
+
+    label = f"🕸️ Graph Context ({len(edges)} relationship(s)"
+    if center:
+        label += f" · center: {center['name']}"
+    label += ")"
+
+    with st.expander(label, expanded=False):
+        if center:
+            st.markdown(
+                f"**Center:** `{center['name']}` *({center['type']})*"
+            )
+        if edges:
+            st.markdown("**Relationships used:**")
+            for e in edges:
+                st.markdown(
+                    f"- **{e['source']}** → `{e['type']}` → **{e['target']}**"
+                )
+        elif neighbors:
+            st.markdown("**Connected entities:**")
+            for n in neighbors:
+                st.markdown(f"- `{n['name']}` *({n['type']})*")
+
+
+def _render_assistant_message(msg: dict) -> None:
+    """Render a stored assistant message with all its context blocks."""
+    st.markdown(msg["content"])
+    if msg.get("thinking"):
+        with st.expander("💭 Reasoning", expanded=False):
+            st.markdown(msg["thinking"])
+    if msg.get("graph_context"):
+        _render_graph_context(msg["graph_context"])
+    if msg.get("sources"):
+        with st.expander(
+            f"📎 Sources ({len(msg['sources'])})", expanded=False
+        ):
+            for i, src in enumerate(msg["sources"], 1):
+                st.markdown(
+                    f"**{i}.** `{src['doc_filename']}` — *{src['section']}* "
+                    f"({src['doc_category']}) | score: `{src['rrf_score']:.4f}`"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +316,9 @@ with st.sidebar:
             key="upload_category",
         )
     with col_b:
-        upload_equipment_id = st.text_input("Equipment ID", key="upload_equipment_id")
+        upload_equipment_id = st.text_input(
+            "Equipment ID", key="upload_equipment_id"
+        )
 
     col_c, col_d = st.columns(2)
     with col_c:
@@ -270,37 +345,70 @@ with st.sidebar:
     # Ingestion progress (only shown when jobs exist)
     # ------------------------------------------------------------------
 
-    jobs = st.session_state.ingestion_jobs
-    if jobs:
+    @st.fragment(run_every=1)
+    def _jobs_progress() -> None:
+        jobs = st.session_state.ingestion_jobs
+        if not jobs:
+            return
+
         st.divider()
         st.markdown("### ⚙️ Processing")
-
-        active_jobs = {
-            jid: j
-            for jid, j in jobs.items()
-            if j["status"] not in ("complete", "error")
-        }
-        done_jobs = {
-            jid: j for jid, j in jobs.items() if j["status"] in ("complete", "error")
-        }
 
         for job_id, job in jobs.items():
             _render_job_progress(job_id, job)
             if job_id != list(jobs.keys())[-1]:
                 st.markdown("---")
 
-        if active_jobs:
-            _poll_jobs()
-            time.sleep(0.8)
-            st.rerun()
-        elif done_jobs:
-            # All jobs finished — pause briefly then clear
-            all_ok = all(j["status"] == "complete" for j in done_jobs.values())
+        has_active = _poll_jobs()
+        if not has_active:
+            all_ok = all(j["status"] == "complete" for j in jobs.values())
             if all_ok:
                 st.toast("All documents ingested successfully!", icon="✅")
-            time.sleep(2)
             st.session_state.ingestion_jobs = {}
-            st.rerun()
+
+    _jobs_progress()
+
+    # ------------------------------------------------------------------
+    # Knowledge graph stats (auto-refreshes every 30 s)
+    # ------------------------------------------------------------------
+
+    st.divider()
+
+    @st.fragment(run_every=30)
+    def _graph_stats_widget() -> None:
+        st.markdown("### 🕸️ Knowledge Graph")
+        try:
+            stats = _get("/graph/stats", timeout=5)
+        except Exception:
+            st.caption("Graph unavailable (Neo4j not connected)")
+            return
+
+        total_e = stats.get("total_entities", 0)
+        total_r = stats.get("total_relationships", 0)
+
+        if total_e == 0:
+            st.caption("No entities yet — ingest documents to build the graph.")
+            return
+
+        col1, col2 = st.columns(2)
+        col1.metric("Entities", total_e)
+        col2.metric("Relationships", total_r)
+
+        by_etype = stats.get("by_entity_type") or {}
+        if by_etype:
+            top = sorted(by_etype.items(), key=lambda x: -x[1])[:6]
+            st.caption(
+                "  ·  ".join(f"**{t}** {c}" for t, c in top)
+            )
+
+        by_rtype = stats.get("by_relationship_type") or {}
+        if by_rtype:
+            top_r = sorted(by_rtype.items(), key=lambda x: -x[1])[:4]
+            st.caption(
+                "  ·  ".join(f"`{t}` {c}" for t, c in top_r)
+            )
+
+    _graph_stats_widget()
 
     # ------------------------------------------------------------------
     # Document library
@@ -346,48 +454,52 @@ with st.expander("🔍 Query Filters", expanded=False):
         with c4:
             st.text_input("Location", key="filter_location")
 
-        col_k, col_btn = st.columns([3, 1])
+        col_k, col_g, col_btn = st.columns([3, 2, 1])
         with col_k:
             st.slider("Top K results", 1, 20, key="filter_top_k")
+        with col_g:
+            st.checkbox(
+                "Use knowledge graph",
+                key="use_graph",
+                help="Augment answers with graph traversal. Disable for pure vector search.",
+            )
         with col_btn:
             st.form_submit_button("Apply", use_container_width=True)
 
 # Render chat history
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-        if msg.get("thinking"):
-            with st.expander("💭 Reasoning", expanded=False):
-                st.markdown(msg["thinking"])
-        if msg.get("sources"):
-            with st.expander(f"📎 Sources ({len(msg['sources'])})", expanded=False):
-                for i, src in enumerate(msg["sources"], 1):
-                    st.markdown(
-                        f"**{i}.** `{src['doc_filename']}` — *{src['section']}* "
-                        f"({src['doc_category']}) | score: `{src['rrf_score']:.4f}`"
-                    )
+        if msg["role"] == "assistant":
+            _render_assistant_message(msg)
+        else:
+            st.markdown(msg["content"])
 
 # Chat input
 if prompt := st.chat_input("Ask a question about your documents…"):
-    # Build filter dict
     def _nonempty(v: str) -> str | None:
         return v.strip() or None
 
-    equip_raw = st.session_state.filter_equipment_id.strip()
     filters = {
-        "equipment_id": equip_raw or None,
+        "equipment_id": _nonempty(st.session_state.filter_equipment_id),
         "file_type": _nonempty(st.session_state.filter_file_type),
-        "document_category": _nonempty(st.session_state.filter_document_category),
+        "document_category": _nonempty(
+            st.session_state.filter_document_category
+        ),
         "location": _nonempty(st.session_state.filter_location),
     }
     top_k = int(st.session_state.filter_top_k)
+    use_graph = st.session_state.use_graph
 
-    # Show user message immediately
     with st.chat_message("user"):
         st.markdown(prompt)
     st.session_state.messages.append({"role": "user", "content": prompt})
 
-    # Call backend and stream answer
+    # Last 6 messages (3 turns) before this one — prior context only
+    history = [
+        {"role": m["role"], "content": m["content"]}
+        for m in st.session_state.messages[:-1]
+    ][-6:]
+
     with st.chat_message("assistant"):
         answer_slot = st.empty()
         answer_slot.markdown("*Thinking…*")
@@ -400,6 +512,8 @@ if prompt := st.chat_input("Ask a question about your documents…"):
                     "filters": filters,
                     "top_k": top_k,
                     "show_thinking": True,
+                    "use_graph": use_graph,
+                    "history": history,
                 },
                 timeout=180,
             )
@@ -409,6 +523,7 @@ if prompt := st.chat_input("Ask a question about your documents…"):
             answer = result.get("answer", "")
             thinking = result.get("thinking")
             sources = result.get("sources", [])
+            graph_context = result.get("graph_context")
 
             answer_slot.markdown(answer)
 
@@ -416,12 +531,18 @@ if prompt := st.chat_input("Ask a question about your documents…"):
                 with st.expander("💭 Reasoning", expanded=False):
                     st.markdown(thinking)
 
+            if graph_context:
+                _render_graph_context(graph_context)
+
             if sources:
-                with st.expander(f"📎 Sources ({len(sources)})", expanded=False):
+                with st.expander(
+                    f"📎 Sources ({len(sources)})", expanded=False
+                ):
                     for i, src in enumerate(sources, 1):
                         st.markdown(
-                            f"**{i}.** `{src['doc_filename']}` — *{src['section']}* "
-                            f"({src['doc_category']}) | score: `{src['rrf_score']:.4f}`"
+                            f"**{i}.** `{src['doc_filename']}` — "
+                            f"*{src['section']}* ({src['doc_category']}) | "
+                            f"score: `{src['rrf_score']:.4f}`"
                         )
 
             st.session_state.messages.append(
@@ -430,6 +551,7 @@ if prompt := st.chat_input("Ask a question about your documents…"):
                     "content": answer,
                     "thinking": thinking,
                     "sources": sources,
+                    "graph_context": graph_context,
                 }
             )
 
