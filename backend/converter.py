@@ -13,10 +13,13 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime
+import logging
 import os
 import re
 from pathlib import Path
 from typing import Any, Callable
+
+logger = logging.getLogger("industryorch-ingest")
 
 import pandas as pd
 
@@ -26,6 +29,14 @@ import pandas as pd
 
 VISION_MODEL = os.environ.get("VISION_MODEL", "").strip()
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+
+# PDF extraction mode:
+#   "hybrid" (default) — PyMuPDF text + pdfplumber tables + optional image description
+#   "vision"           — render each page to PNG, send to vision LLM for full extraction
+PDF_EXTRACT_MODE = os.environ.get("PDF_EXTRACT_MODE", "hybrid").lower()
+
+# Resolution for vision-mode page rendering (144 DPI = 2× PyMuPDF base of 72 DPI)
+_VISION_DPI_SCALE = float(os.environ.get("PDF_VISION_DPI_SCALE", "2.0"))
 
 # Skip images smaller than this (filters out icons / decorative elements)
 _MIN_IMG_WIDTH = 100
@@ -150,7 +161,7 @@ def _evict_vision_model() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _convert_pdf(
+def _convert_pdf_hybrid(
     file_path: str,
     progress_callback: Callable[[str], None] | None = None,
 ) -> tuple[str, dict[str, Any]]:
@@ -258,6 +269,145 @@ def _convert_pdf(
         "detected_revision": _find_first_revision(full_md),
         "page_count": page_count,
     }
+
+
+# ---------------------------------------------------------------------------
+# PDF — vision extraction mode
+# ---------------------------------------------------------------------------
+
+_VISION_EXTRACTION_PROMPT = """\
+This is page {page_num} of {page_count} from an industrial technical document.
+Extract ALL content as structured markdown. Rules:
+- Use ##, ### for section headings found on the page
+- Convert EVERY table to a markdown table (| col | col |\\n|---|---|\\n| val | val |)
+- For figures, charts, or diagrams write one line: **[Figure]** brief description
+- Copy all numbers, units, part numbers, codes, and identifiers exactly as shown
+- Do not add commentary — output only the extracted content\
+"""
+
+
+def _extract_page_vision(
+    img_bytes: bytes,
+    page_num: int,
+    page_count: int,
+    keep_alive: str | int = "5m",
+) -> str | None:
+    """Send a rendered page image to the vision LLM and return markdown."""
+    if not VISION_MODEL:
+        return None
+    try:
+        import ollama
+
+        prompt = _VISION_EXTRACTION_PROMPT.format(
+            page_num=page_num, page_count=page_count
+        )
+        resp = ollama.chat(
+            model=VISION_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt,
+                    "images": [base64.b64encode(img_bytes).decode()],
+                }
+            ],
+            keep_alive=keep_alive,
+        )
+        text = (resp.message.content or "").strip()
+        return text if text else None
+    except Exception as exc:
+        logger.warning("Vision extraction failed for page %d: %s", page_num, exc)
+        return None
+
+
+def _convert_pdf_vision(
+    file_path: str,
+    progress_callback: Callable[[str], None] | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Extract markdown from a PDF by rendering pages as images and using a vision LLM.
+
+    Each page is rendered to PNG at _VISION_DPI_SCALE × 72 DPI (default 144 DPI)
+    and sent to VISION_MODEL with a structured extraction prompt. Falls back to
+    the hybrid extractor for any page where the vision model returns nothing.
+    """
+    try:
+        import fitz
+    except ImportError:
+        raise ImportError("Install PyMuPDF: pip install pymupdf")
+
+    path = Path(file_path)
+    title = path.stem
+    doc = fitz.open(file_path)
+    page_count = len(doc)
+    md_parts: list[str] = []
+    mat = fitz.Matrix(_VISION_DPI_SCALE, _VISION_DPI_SCALE)
+
+    logger.info(
+        "PDF vision extraction: %d page(s), model=%s, scale=%.1fx",
+        page_count, VISION_MODEL, _VISION_DPI_SCALE,
+    )
+
+    for page_idx in range(page_count):
+        if progress_callback:
+            progress_callback(
+                f"Extracting page {page_idx + 1}/{page_count} (vision) …"
+            )
+
+        fitz_page = doc[page_idx]
+        heading = f"## Page {page_idx + 1}" if page_count > 1 else f"# {title}"
+
+        is_last = page_idx == page_count - 1
+        keep_alive: str | int = 0 if is_last else "5m"
+
+        # Render page to PNG bytes
+        pix = fitz_page.get_pixmap(matrix=mat)
+        img_bytes = pix.tobytes("png")
+
+        md = _extract_page_vision(
+            img_bytes, page_idx + 1, page_count, keep_alive=keep_alive
+        )
+
+        if md:
+            md_parts.append(f"{heading}\n\n{md}")
+        else:
+            # Vision returned nothing — fall back to simple text extraction
+            logger.warning(
+                "Vision returned nothing for page %d — using text fallback",
+                page_idx + 1,
+            )
+            text = fitz_page.get_text("text") or ""
+            if text.strip():
+                md_parts.append(f"{heading}\n\n{text.strip()}")
+
+        md_parts.append("---")
+
+    doc.close()
+
+    full_md = "\n\n".join(md_parts)
+    first_dates = _find_first_dates(full_md)
+
+    return full_md, {
+        "title": title,
+        "detected_date": first_dates[0].isoformat() if first_dates else None,
+        "detected_revision": _find_first_revision(full_md),
+        "page_count": page_count,
+        "extract_mode": "vision",
+    }
+
+
+def _convert_pdf(
+    file_path: str,
+    progress_callback: Callable[[str], None] | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Dispatch to vision or hybrid PDF extraction based on PDF_EXTRACT_MODE."""
+    if PDF_EXTRACT_MODE == "vision":
+        if not VISION_MODEL:
+            logger.warning(
+                "PDF_EXTRACT_MODE=vision but VISION_MODEL is not set "
+                "— falling back to hybrid extraction"
+            )
+        else:
+            return _convert_pdf_vision(file_path, progress_callback)
+    return _convert_pdf_hybrid(file_path, progress_callback)
 
 
 # ---------------------------------------------------------------------------

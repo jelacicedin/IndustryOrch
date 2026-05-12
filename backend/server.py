@@ -140,8 +140,11 @@ class Source(BaseModel):
     doc_category: str
     doc_equipment_id: str | None
     section: str
+    page_number: int | None
+    content_type: str
     chunk_index: int
     rrf_score: float
+    chunk_content: str
 
 
 class QueryResponse(BaseModel):
@@ -342,13 +345,11 @@ async def _hybrid_search(
 
     results = []
     for row in rows:
-        meta = row["chunk_metadata"] or {}
-        section = (
-            meta.get("section_heading", "Unknown")
-            if isinstance(meta, dict)
-            else "Unknown"
-        )
-        chunk_index = meta.get("chunk_index", 0) if isinstance(meta, dict) else 0
+        meta = row["chunk_metadata"] or {} if isinstance(row["chunk_metadata"], dict) else {}
+        section = meta.get("section_heading") or ""
+        page_number = meta.get("page_number")
+        content_type = meta.get("content_type", "prose")
+        chunk_index = meta.get("chunk_index", 0)
         results.append(
             {
                 "chunk_id": int(row["chunk_id"]),
@@ -358,6 +359,8 @@ async def _hybrid_search(
                 "doc_category": str(row["doc_category"]),
                 "doc_equipment_id": row["doc_equipment_id"],
                 "section": section,
+                "page_number": int(page_number) if page_number is not None else None,
+                "content_type": content_type,
                 "chunk_index": chunk_index,
                 "rrf_score": float(row["rrf_score"]),
             }

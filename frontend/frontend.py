@@ -274,6 +274,45 @@ def _render_graph_context(gc: dict) -> None:
                 st.markdown(f"- `{n['name']}` *({n['type']})*")
 
 
+def _source_label(i: int, src: dict) -> str:
+    """Build the one-line expander label for a source chunk."""
+    filename = src.get("doc_filename", "Unknown file")
+    page = src.get("page_number")
+    section = src.get("section", "")
+    content_type = src.get("content_type", "")
+
+    location_parts = []
+    if page:
+        location_parts.append(f"p.{page}")
+    if section and section not in ("Unknown", "Document", ""):
+        truncated = section if len(section) <= 48 else section[:48] + "…"
+        location_parts.append(truncated)
+    if content_type == "table":
+        location_parts.append("📊 table")
+
+    location = " · ".join(location_parts) if location_parts else src.get("doc_category", "")
+    return f"Source {i} — {filename}  |  {location}"
+
+
+def _render_sources(sources: list) -> None:
+    """Render each source as an individual expander showing the chunk content."""
+    st.markdown(f"**📎 Sources ({len(sources)})**")
+    for i, src in enumerate(sources, 1):
+        score = src.get("rrf_score", 0)
+        category = src.get("doc_category", "")
+        equipment = src.get("doc_equipment_id") or ""
+        content = src.get("chunk_content", "")
+
+        with st.expander(_source_label(i, src), expanded=False):
+            meta_parts = [category]
+            if equipment:
+                meta_parts.append(f"equip: {equipment}")
+            meta_parts.append(f"score: {score:.4f}")
+            st.caption(" · ".join(meta_parts))
+            if content:
+                st.markdown(content)
+
+
 def _render_assistant_message(msg: dict) -> None:
     """Render a stored assistant message with all its context blocks."""
     st.markdown(msg["content"])
@@ -283,14 +322,7 @@ def _render_assistant_message(msg: dict) -> None:
     if msg.get("graph_context"):
         _render_graph_context(msg["graph_context"])
     if msg.get("sources"):
-        with st.expander(
-            f"📎 Sources ({len(msg['sources'])})", expanded=False
-        ):
-            for i, src in enumerate(msg["sources"], 1):
-                st.markdown(
-                    f"**{i}.** `{src['doc_filename']}` — *{src['section']}* "
-                    f"({src['doc_category']}) | score: `{src['rrf_score']:.4f}`"
-                )
+        _render_sources(msg["sources"])
 
 
 # ---------------------------------------------------------------------------
@@ -535,15 +567,7 @@ if prompt := st.chat_input("Ask a question about your documents…"):
                 _render_graph_context(graph_context)
 
             if sources:
-                with st.expander(
-                    f"📎 Sources ({len(sources)})", expanded=False
-                ):
-                    for i, src in enumerate(sources, 1):
-                        st.markdown(
-                            f"**{i}.** `{src['doc_filename']}` — "
-                            f"*{src['section']}* ({src['doc_category']}) | "
-                            f"score: `{src['rrf_score']:.4f}`"
-                        )
+                _render_sources(sources)
 
             st.session_state.messages.append(
                 {
